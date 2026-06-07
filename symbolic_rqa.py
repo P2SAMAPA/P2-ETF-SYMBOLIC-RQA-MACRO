@@ -7,18 +7,22 @@ def compute_macro_weights(macro_df, target_returns):
     Estimate weights for macro variables via ridge regression of next-day return on macro.
     Returns: weight vector (normalised) and scaler for macro variables.
     """
-    if len(macro_df) != len(target_returns):
-        min_len = min(len(macro_df), len(target_returns))
-        macro_df = macro_df.iloc[:min_len]
-        target_returns = target_returns[:min_len]
-    if len(target_returns) < 5:
-        return np.ones(macro_df.shape[1]) / macro_df.shape[1], StandardScaler()
+    # Ensure no NaN in either input
+    macro_df = macro_df.copy()
+    target_returns = np.array(target_returns).flatten()
+    # Remove rows with any NaN in macro or target
+    mask = ~(np.isnan(target_returns) | np.isnan(macro_df).any(axis=1))
+    macro_clean = macro_df[mask]
+    target_clean = target_returns[mask]
+    if len(target_clean) < 5:
+        n_macro = macro_df.shape[1]
+        return np.ones(n_macro) / n_macro, StandardScaler()
     # Standardise macro
     scaler = StandardScaler()
-    macro_scaled = scaler.fit_transform(macro_df)
+    macro_scaled = scaler.fit_transform(macro_clean)
     # Ridge regression
     ridge = Ridge(alpha=1.0)
-    ridge.fit(macro_scaled, target_returns)
+    ridge.fit(macro_scaled, target_clean)
     coef = ridge.coef_
     # Normalise weights to positive and sum to 1
     pos_weights = np.maximum(coef, 0)
@@ -30,6 +34,10 @@ def compute_macro_weights(macro_df, target_returns):
 
 def macro_factor(macro_row, weights, scaler):
     """Compute composite macro factor from a single row of macro variables."""
+    # Ensure macro_row is a numpy array
+    macro_row = np.asarray(macro_row).flatten()
+    if np.isnan(macro_row).any():
+        return 1.0
     # Standardise macro row using the same scaler (if fit)
     if scaler is not None:
         macro_scaled = scaler.transform(macro_row.reshape(1, -1)).flatten()
@@ -44,6 +52,9 @@ def recurrence_rate(series, macro_factor, embedding_dim=3, tau=1, base_quantile=
     """
     Compute recurrence rate for the last point in the series using macro‑conditioned threshold.
     """
+    series = np.asarray(series).flatten()
+    if np.isnan(series).any():
+        return 0.0
     n = len(series)
     if n < embedding_dim * tau + 2:
         return 0.0
@@ -54,7 +65,6 @@ def recurrence_rate(series, macro_factor, embedding_dim=3, tau=1, base_quantile=
         for j in range(embedding_dim):
             states[i, j] = series[i + j * tau]
     # Compute pairwise distances (only for the last point? We need threshold for the whole recurrence matrix)
-    # We'll use the global distribution of distances to set base threshold
     all_distances = []
     for i in range(N_state):
         for j in range(N_state):
@@ -80,27 +90,37 @@ def recurrence_rate(series, macro_factor, embedding_dim=3, tau=1, base_quantile=
 def rqa_score(returns, macro_df, embedding_dim=3, tau=1, base_quantile=0.1, gamma=0.5):
     """
     Compute RQA recurrence rate for a single ETF using macro‑conditioned threshold.
-    Weights are estimated from the relationship between macro and next‑day returns (in‑sample within the window).
     """
-    if len(returns) < embedding_dim * tau + 2 or macro_df is None or macro_df.empty:
+    # Convert to numpy arrays and drop NaN
+    returns = np.asarray(returns).flatten()
+    if macro_df is None or macro_df.empty:
         return 0.0
-    # Align returns and macro
+    macro_df = macro_df.copy()
+    # Align lengths
     min_len = min(len(returns), len(macro_df))
     returns = returns[:min_len]
     macro_df = macro_df.iloc[:min_len]
-    # Compute macro weights using ridge regression of next‑day return on macro (shifted by 1)
-    # We need target_returns = returns[1:] and macro aligned
+    # Remove any remaining NaN
+    mask = ~np.isnan(returns)
+    returns = returns[mask]
+    macro_df = macro_df[mask]
+    if len(returns) < embedding_dim * tau + 2:
+        return 0.0
+    # Compute macro weights using ridge regression on target = next-day return
     if len(returns) < 2:
         return 0.0
     target = returns[1:]
-    macro_aligned = macro_df.iloc[:-1] if len(macro_df) == len(returns) else macro_df[:len(target)]
+    macro_aligned = macro_df.iloc[:-1]
     if len(target) != len(macro_aligned):
         min_len2 = min(len(target), len(macro_aligned))
         target = target[:min_len2]
         macro_aligned = macro_aligned.iloc[:min_len2]
     if len(target) < 5:
-        return 0.0
-    weights, scaler = compute_macro_weights(macro_aligned, target)
+        # fallback: equal weights
+        weights = np.ones(macro_df.shape[1]) / macro_df.shape[1]
+        scaler = None
+    else:
+        weights, scaler = compute_macro_weights(macro_aligned, target)
     # Current macro (last row) to compute factor for threshold
     current_macro = macro_df.iloc[-1].values
     factor = macro_factor(current_macro, weights, scaler)
